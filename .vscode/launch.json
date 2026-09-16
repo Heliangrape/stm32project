@@ -1,0 +1,39 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "STLink (Mac)",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/stm32project.elf",
+            "request": "launch",
+            "type": "cortex-debug",
+            "device": "STM32F407IG",
+            "servertype": "openocd",
+            "armToolchainPath": "/Applications/ArmGNUToolchain/13.3.rel1/arm-none-eabi/bin",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32f4x.cfg"
+            ],
+            "runToEntryPoint": "main",
+            "preLaunchTask": "build task",
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            }
+        },
+        {
+            "name": "STLink-Attach (Mac)",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/stm32project.elf",
+            "request": "attach",
+            "type": "cortex-debug",
+            "device": "STM32F407IG",
+            "servertype": "openocd",
+            "armToolchainPath": "/Applications/ArmGNUToolchain/13.3.rel1/arm-none-eabi/bin",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32f4x.cfg"
+            ]
+        }
+    ]
+}

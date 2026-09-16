@@ -1,0 +1,20 @@
+{
+    "tasks": [
+        {
+            "label": "build task",
+            "type": "shell",
+            "command": "make -j$(sysctl -n hw.ncpu)",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ],
+    "version": "2.0.0"
+}
