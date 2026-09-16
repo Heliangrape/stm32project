@@ -131,7 +131,9 @@ int MOTOR1_CURRENT = 500;      // 1号电机电流：正=正转，负=反转，�
 
 /*
  * CAN1 初始化，整个程序只调用一次
- * 波特率 = APB1 / (Prescaler x (1 + TimeSeg1 + TimeSeg2)) = 16MHz / 16 = 1Mbps
+ * 波特率 = APB1 / (Prescaler x (1 + TimeSeg1 + TimeSeg2))
+ *        = 42MHz / (3 x (1 + 11 + 2)) = 42MHz / 42 = 1Mbps
+ * 注意：APB1 频率由时钟配置决定，换了晶振/时钟树后这里必须重新算
  */
 static void CAN1_Init(void)
 {
@@ -152,11 +154,11 @@ static void CAN1_Init(void)
   HAL_GPIO_Init(GPIOD, &gpio);
 
   hcan1.Instance           = CAN1;             // CAN1 外设
-  hcan1.Init.Prescaler     = 1;                // 分频
+  hcan1.Init.Prescaler     = 3;                // 分频（APB1=42MHz，3x14=42 → 正好 1Mbps）
   hcan1.Init.Mode          = CAN_MODE_NORMAL;  // 正常模式
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;      // 同步跳转宽度
-  hcan1.Init.TimeSeg1      = CAN_BS1_12TQ;     // 段1
-  hcan1.Init.TimeSeg2      = CAN_BS2_3TQ;      // 段2（1+12+3=16 → 1Mbps）
+  hcan1.Init.TimeSeg1      = CAN_BS1_11TQ;     // 段1
+  hcan1.Init.TimeSeg2      = CAN_BS2_2TQ;      // 段2（1+11+2=14 → 3x14=42 → 1Mbps，采样点 85.7%）
   hcan1.Init.TimeTriggeredMode    = DISABLE;
   hcan1.Init.AutoBusOff           = ENABLE;
   hcan1.Init.AutoWakeUp           = DISABLE;
