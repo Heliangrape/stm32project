@@ -9,7 +9,8 @@
 - DBUS 遥控器收帧（DMA + 空闲中断），带掉线超时检测
 - CAN1 收 4 路电调反馈（0x201~0x204），发 0x200 控制帧
 - USART1 串口打印遥控器数据（115200，DMA 发送）
-- 每个电机可单独配置转向系数，适配镜像安装
+- 麦轮底盘：右摇杆 **上下=前后**、**左右=横移**（线性叠加，不含旋转）
+- 每台电机的前后/左右方向系数可单独配置，适配镜像安装
 
 ## 硬件
 
@@ -87,7 +88,12 @@ openocd -f interface/stlink.cfg -f target/stm32f4x.cfg \
 
 ## 使用
 
-遥控器右摇杆**上下**（`rc_ctrl.rc.ch[1]`）控制全部 4 个电机的目标转速，满量程 ±660：
+右摇杆两个方向分别控制前后和横移（摇杆满量程 ±660）：
+
+| 通道 | 方向 | 目标转速 |
+|---|---|---|
+| `rc.ch[1]` | 右摇杆 **上下** | `fakeUseSpeed = ch[1] * 2`（前后，±1320 RPM） |
+| `rc.ch[0]` | 右摇杆 **左右** | `fakeUseSpeedLR = ch[0] * 2`（横移，同强度） |
 
 ```c
 fakeUseSpeed = rc_ctrl.rc.ch[1] * 2;   // 目标转速：±1320 RPM
@@ -106,15 +112,19 @@ fakeUseSpeed = rc_ctrl.rc.ch[1] * 2;   // 目标转速：±1320 RPM
 | `HAL_UARTEx_RxEventCallback()` | 解析 DBUS 18 字节帧 → `rc_ctrl` |
 | 主循环 | 1 kHz 速度环 + 100 ms 串口打印 |
 
-**控制模型**：`电流 = 方向系数 × 目标转速 − 电机反馈转速`（比例控制，限幅 ±2000）。
-`SpeedLoop_Fake()` 里每个电机的**方向系数**（`+1` / `-1`）决定它往哪边转：
+**控制模型**：`电流 = 前后项 + 左右项 − 电机反馈转速`（比例控制，限幅 ±2000）。
+`SpeedLoop_Fake()` 里每台电机有两个**方向系数**：前后系数、左右系数（各取 `+1` / `-1`）：
 
 ```c
-fakeUseCurrent1 = (-1) * fakeUseSpeed - RxSpeed4[0];   /* 系数取 +1 还是 -1，看装车方向 */
-fakeUseCurrent2 = ( 1) * fakeUseSpeed - RxSpeed4[1];
-fakeUseCurrent3 = ( 1) * fakeUseSpeed - RxSpeed4[2];
-fakeUseCurrent4 = (-1) * fakeUseSpeed - RxSpeed4[3];
+fakeUseCurrent1 = (-1) * fakeUseSpeed + (-1) * fakeUseSpeedLR - RxSpeed4[0];
+fakeUseCurrent2 = ( 1) * fakeUseSpeed + (-1) * fakeUseSpeedLR - RxSpeed4[1];
+fakeUseCurrent3 = ( 1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR - RxSpeed4[2];
+fakeUseCurrent4 = (-1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR - RxSpeed4[3];
 ```
+
+> **左右系数怎么来的**：麦轮横移时左右两侧轮子的世界转向相反，所以
+> `本体左右系数 = 前后系数 × 横移分配`（左侧 `+1`、右侧 `−1`）。若横移方向反了，
+> 把 4 个左右系数整体取反即可。
 
 > 哪几路取 `-1` **取决于你自己的装车方向**，每台车都不一样 —— 上电后给个小的目标转速实测，
 > 方向不对就把那一行的符号反过来。上面是本工程当前的配置，仅供参考。

@@ -96,9 +96,21 @@ volatile int16_t  RxSpeed;        // 转速 RPM（正=正转）
 volatile int16_t  RxCurrent;      // 实际转矩电流
 volatile uint8_t  RxTemp; 
 
+/* --- 4 个电机的反馈：下标 [0]~[3] 对应 CAN ID 0x201~0x204 --- */
+volatile uint16_t RxEcd4[4];      // 各电机角度
+volatile int16_t  RxSpeed4[4];    // 各电机转速 RPM
+volatile int16_t  RxCurrent4[4];  // 各电机实际电流
+volatile uint8_t  RxTemp4[4];     // 各电机温度
+volatile uint32_t RxCount4[4];    // 各电机收帧计数
+
 volatile int16_t initAngle;        // 机械角度（0~8191）
-volatile int16_t fakeUseCurrent = 500;
-volatile int16_t fakeUseSpeed   = 1500; 
+volatile int16_t fakeUseCurrent  = 500;   // 老变量保留
+volatile int16_t fakeUseCurrent1 = 0;     // 1 号电机输出电流
+volatile int16_t fakeUseCurrent2 = 0;     // 2 号电机输出电流
+volatile int16_t fakeUseCurrent3 = 0;     // 3 号电机输出电流
+volatile int16_t fakeUseCurrent4 = 0;     // 4 号电机输出电流
+volatile int16_t fakeUseSpeed   = 1500;
+volatile int16_t fakeUseSpeedLR = 0;      // 左右平移目标转速（0号通道，同强度） 
 
 /* --- 遥控器（DBUS）：WATCH 里直接看 rc_ctrl.rc.ch[0]~[3] --- */
 uint8_t  rc_buf[RC_FRAME_LENGTH];     /* DMA 接收缓冲区：原始 18 字节（生数据） */
@@ -236,17 +248,33 @@ static void CAN_cmd_chassis(int16_t cur1, int16_t cur2, int16_t cur3, int16_t cu
 
 static void SpeedLoop_Fake(void)
 {
-  fakeUseCurrent = fakeUseSpeed - RxSpeed;
+  /* 目标转速 = 前后项(fakeUseSpeed) + 左右项(fakeUseSpeedLR)，各自带自己的方向系数
+     麦轮横移时左右两侧轮子的世界转向相反 → 本体系数 = 前后系数 × 横移分配 */
+  /* 每行开头的方向系数：+1 = 与 1 号电机同向；-1 = 镜像安装（本体必须反转才跟大家同向）
+     —— 哪个电机转反了，就改那一行的符号
+     注意：RxSpeed4[i] 是"电机本体"的转速，不乘方向系数 */
+  fakeUseCurrent1 = (-1) * fakeUseSpeed + (-1) * fakeUseSpeedLR - RxSpeed4[0];   /* 1 号：本体反向 */
+  fakeUseCurrent2 = ( 1) * fakeUseSpeed + (-1) * fakeUseSpeedLR - RxSpeed4[1];   /* 2 号：本体反向 */
+  fakeUseCurrent3 = ( 1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR - RxSpeed4[2];   /* 3 号：正常 */
+  fakeUseCurrent4 = (-1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR - RxSpeed4[3];   /* 4 号：正常 */
 
-  if (fakeUseCurrent > 2000) 
+  if (fakeUseCurrent1 > 2000) 
   {
-    fakeUseCurrent = 2000;
+    fakeUseCurrent1 = 2000;
   }
-  if (fakeUseCurrent < -2000)
+  if (fakeUseCurrent1 < -2000)
   {
-    fakeUseCurrent = -2000;
+    fakeUseCurrent1 = -2000;
   }
-  CAN_cmd_chassis(fakeUseCurrent, 0, 0, 0);
+  /* 2/3/4 号电机同样的限幅 */
+  if (fakeUseCurrent2 >  2000) fakeUseCurrent2 =  2000;
+  if (fakeUseCurrent2 < -2000) fakeUseCurrent2 = -2000;
+  if (fakeUseCurrent3 >  2000) fakeUseCurrent3 =  2000;
+  if (fakeUseCurrent3 < -2000) fakeUseCurrent3 = -2000;
+  if (fakeUseCurrent4 >  2000) fakeUseCurrent4 =  2000;
+  if (fakeUseCurrent4 < -2000) fakeUseCurrent4 = -2000;
+
+  CAN_cmd_chassis(fakeUseCurrent1, fakeUseCurrent2, fakeUseCurrent3, fakeUseCurrent4);
 }
 
 /* ============ 位置环（外环，只用 P 和 D）============ */
@@ -317,8 +345,10 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan1)
 
     /* ② 保存帧 ID 和原始 8 字节（调试器里可以直接看） */
     RxStdId = RxHeader.StdId;
-    if (RxStdId == 0x201)                           
+    /* 只处理 0x201~0x204 四个电调反馈帧；idx = 0~3 对应电机 1~4 */
+    if (RxStdId >= 0x201 && RxStdId <= 0x204)                           
       {
+        int idx = (int)(RxStdId - 0x201);                // 0~3 对应电机 1~4
         for (int i = 0; i < 8; i++) RxData[i] = tmp[i];  // 拷贝 8 字节（原始）
         RxCount++;                                       // 帧数 +1
       
@@ -327,18 +357,26 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan1)
             作用：不用调试器也能判断接收死活
                   绿灯稳定闪烁 = 接收正常 ✅
                   绿灯不动     = 接收断了 ❌                        */
-      if ((RxCount % 500) == 1)
+      if ((RxCount % 2000) == 1)   // 4 个电机共约 4kHz 帧率 → 2000 帧仍约 2Hz
       {
         /* HAL函数：翻转引脚电平（当前是高就变低，是低就变高） */
         HAL_GPIO_TogglePin(LED_G_GPIO_Port, LED_G_Pin);
       }
 
       /* 按电调反馈帧格式拼出物理量：高八位在前，低八位在后 */
-      RxEcd     = (uint16_t)((RxData[0] << 8) | RxData[1]);  // 编码器角度 0~8191
-      RxSpeed   = (int16_t) ((RxData[2] << 8) | RxData[3]);  // 转速 RPM
-      RxCurrent = (int16_t) ((RxData[4] << 8) | RxData[5]);  // 实际电流
-      RxTemp    = RxData[6];          
-      Rotate_Fake(400000);                    
+      /* 每个电机只填自己那一格：idx 0~3 ←→ 电机 1~4 */
+      RxEcd4[idx]     = (uint16_t)((tmp[0] << 8) | tmp[1]);  // 编码器角度 0~8191
+      RxSpeed4[idx]   = (int16_t) ((tmp[2] << 8) | tmp[3]);  // 转速 RPM
+      RxCurrent4[idx] = (int16_t) ((tmp[4] << 8) | tmp[5]);  // 实际电流
+      RxTemp4[idx]    = tmp[6];                              // 温度
+      RxCount4[idx]++;                                       // 该电机累计帧数
+
+      /* 1 号电机的值同步留在老变量里（调试习惯 + Rotate_Fake 在用） */
+      RxEcd     = RxEcd4[0];
+      RxSpeed   = RxSpeed4[0];
+      RxCurrent = RxCurrent4[0];
+      RxTemp    = RxTemp4[0];          
+                         
     }
   }
   //aaa
@@ -553,7 +591,10 @@ int main(void)
     /* HAL函数：阻塞式延时 1 毫秒（靠 SysTick 中断计时）
        这里的作用：构成固定 1kHz 的控制周期（PID 必须等间隔执行） */
     HAL_Delay(1); 
-    HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, GPIO_PIN_SET);       // 1kHz 控制周期
+    HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, GPIO_PIN_SET); 
+    fakeUseSpeed   = rc_ctrl.rc.ch[1] * 2;  // 右摇杆 上下 → 前后
+    fakeUseSpeedLR = rc_ctrl.rc.ch[0] * 2;  // 右摇杆 左右 → 横移
+    SpeedLoop_Fake();      // 1kHz 控制周期
 
     /* 每 100ms 往电脑串口助手打印一次遥控器数据（用 DMA 发送，不占 CPU） */
     if (HAL_GetTick() - rc_print_tick >= 100)
