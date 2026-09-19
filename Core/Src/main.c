@@ -111,6 +111,7 @@ volatile int16_t fakeUseCurrent3 = 0;     // 3 号电机输出电流
 volatile int16_t fakeUseCurrent4 = 0;     // 4 号电机输出电流
 volatile int16_t fakeUseSpeed   = 1500;
 volatile int16_t fakeUseSpeedLR = 0;      // 左右平移目标转速（0号通道，同强度） 
+volatile int16_t fakeUseOmega = 0;
 
 /* --- 遥控器（DBUS）：WATCH 里直接看 rc_ctrl.rc.ch[0]~[3] --- */
 uint8_t  rc_buf[RC_FRAME_LENGTH];     /* DMA 接收缓冲区：原始 18 字节（生数据） */
@@ -253,10 +254,10 @@ static void SpeedLoop_Fake(void)
   /* 每行开头的方向系数：+1 = 与 1 号电机同向；-1 = 镜像安装（本体必须反转才跟大家同向）
      —— 哪个电机转反了，就改那一行的符号
      注意：RxSpeed4[i] 是"电机本体"的转速，不乘方向系数 */
-  fakeUseCurrent1 = (-1) * fakeUseSpeed + (-1) * fakeUseSpeedLR - RxSpeed4[0];   /* 1 号：本体反向 */
-  fakeUseCurrent2 = ( 1) * fakeUseSpeed + (-1) * fakeUseSpeedLR - RxSpeed4[1];   /* 2 号：本体反向 */
-  fakeUseCurrent3 = ( 1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR - RxSpeed4[2];   /* 3 号：正常 */
-  fakeUseCurrent4 = (-1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR - RxSpeed4[3];   /* 4 号：正常 */
+  fakeUseCurrent1 = (-1) * fakeUseSpeed + (-1) * fakeUseSpeedLR + (1) * fakeUseOmega - RxSpeed4[0];   /* 1 号：本体反向 */
+  fakeUseCurrent2 = ( 1) * fakeUseSpeed + (-1) * fakeUseSpeedLR + (1) * fakeUseOmega - RxSpeed4[1];   /* 2 号：本体反向 */
+  fakeUseCurrent3 = ( 1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR + (1) * fakeUseOmega - RxSpeed4[2];   /* 3 号：正常 */
+  fakeUseCurrent4 = (-1) * fakeUseSpeed + ( 1) * fakeUseSpeedLR + (1) * fakeUseOmega - RxSpeed4[3];   /* 4 号：正常 */
 
   if (fakeUseCurrent1 > 2000) 
   {
@@ -545,9 +546,8 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   */
 int main(void)
 {
-
+\\
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -592,8 +592,9 @@ int main(void)
        这里的作用：构成固定 1kHz 的控制周期（PID 必须等间隔执行） */
     HAL_Delay(1); 
     HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, GPIO_PIN_SET); 
-    fakeUseSpeed   = rc_ctrl.rc.ch[1] * 2;  // 右摇杆 上下 → 前后
-    fakeUseSpeedLR = rc_ctrl.rc.ch[0] * 2;  // 右摇杆 左右 → 横移
+    fakeUseSpeed   = rc_ctrl.rc.ch[1] * 3;  // 右摇杆 上下 → 前后
+    fakeUseSpeedLR = rc_ctrl.rc.ch[0] * 3;
+    fakeUseOmega = rc_ctrl.rc.ch[2] * 3;
     SpeedLoop_Fake();      // 1kHz 控制周期
 
     /* 每 100ms 往电脑串口助手打印一次遥控器数据（用 DMA 发送，不占 CPU） */
