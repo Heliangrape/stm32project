@@ -216,7 +216,11 @@ static void CAN1_Init(void)
   /* HAL函数：用 hcan1.Init 里的参数初始化 CAN1 控制器
      内部动作：算波特率、把分频/时间段/工作模式写进 CAN 寄存器 */
   HAL_CAN_Init(&hcan1);
-
+  gpio.Pin  = GPIO_PIN_8 | GPIO_PIN_9;
+  gpio.Mode = GPIO_MODE_ANALOG;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &gpio);
+  
   /*
    * 过滤器（ID_LIST 列表模式）：只放行 0x201~0x204 四个电调反馈帧
    * 注意：16 位列表模式下这 4 个字段都是"ID 存储位"，标准 ID 需左移 5 位
@@ -736,9 +740,18 @@ int main(void)
   while (1)
   {
          // 速度环：目标 500 RPM，PI 输出电流（带双保护）
-    /* HAL函数：阻塞式延时 1 毫秒（靠 SysTick 中断计时）
-       这里的作用：构成固定 1kHz 的控制周期（PID 必须等间隔执行） */
-    HAL_Delay(1); 
+    /* ---- 精确 1ms 周期（1kHz）----
+       ★ 不能用 HAL_Delay(1)：HAL 内部 wait = Delay + uwTickFreq = 1 + 1 = 2，
+         实际会等 1~2ms（平均 1.5ms）→ dt 就不准了 → 积分出的角度只有真实的一半
+         （车转 360°，INS_yaw 只积到 180°，于是推前正好变成往后）。
+       这里自己等到 SysTick 前进一格，周期才是真正的 1ms。
+       注意：循环体若某天超过 1ms，这一格会被跳过，周期就变成 2ms。 */
+    {
+      static uint32_t last_tick = 0;
+      uint32_t now_tick;
+      do { now_tick = HAL_GetTick(); } while (now_tick == last_tick);
+      last_tick = now_tick;
+    }
     HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, GPIO_PIN_SET);
 
     /* ---- BMI088 陀螺仪：读角速度 + 积分成绝对角度 ---- */
@@ -748,10 +761,11 @@ int main(void)
       BMI088_gyro[0] = g[0];      /* 存进全局变量，WATCH 里可以直接看 */
       BMI088_gyro[1] = g[1];
       BMI088_gyro[2] = g[2];
-      /* 绝对角度 = Z 轴角速度积分（先减掉零漂），dt = 1ms
-         注意：256 分频下每次读约 200us，主循环实际约 1.2ms；
-               若转 90° 后 INS_yaw 明显小于 1.57，就把 0.001f 改成 0.0012f */
-      INS_yaw += (g[2] - gyro_offset[2]) * 0.001f;
+      /* 绝对角度 = Z 轴角速度积分（先减掉零漂）
+         ★ 循环开头的 SysTick 对齐已保证周期是严格 1ms，所以 dt = 0.001f 是准的。
+           以后若发现"转一整圈后 INS_yaw 不是回到 0"，先量一次实际周期，
+           再改这个系数：新系数 = 0.001 × 6.2832 ÷ (转一圈时 INS_yaw 的读数) */
+      INS_yaw -= (g[2] - gyro_offset[2]) * 0.001f;
       /* 归一化到 ±π：每 1ms 的增量极小，两个 if 足够，不需要 while */
       if (INS_yaw >  3.14159265f) INS_yaw -= 6.28318531f;
       if (INS_yaw < -3.14159265f) INS_yaw += 6.28318531f;
@@ -970,7 +984,7 @@ static void MX_USART3_UART_Init(void)
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 100000;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.WordLength = UART_WORDLENGTH_9B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_EVEN;
   huart3.Init.Mode = UART_MODE_TX_RX;
