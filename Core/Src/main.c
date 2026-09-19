@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdarg.h>     /* va_list / va_start / va_end   → 实现变参 printf */
 #include <stdio.h>      /* vsnprintf                     → 格式化字符串   */
+#include <math.h>       /* sinf / cosf                   → 地面系旋转     */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -66,6 +67,11 @@ typedef struct
 /* ============ printf 发送缓冲区大小 ============ */
 #define PRINT_BUF_SIZE     256
 
+/* ============ BMI088 陀螺仪 ============ */
+/* 上电复位后的默认量程是 ±2000 dps（芯片默认值，不用写寄存器配置）
+   → 1 LSB = 1/16.384 °/s = 0.0010653 rad/s */
+#define BMI088_GYRO_SEN    0.0010653f
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,6 +80,10 @@ typedef struct
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+CAN_HandleTypeDef hcan1;
+
+SPI_HandleTypeDef hspi1;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart1_tx;
@@ -113,6 +123,12 @@ volatile int16_t fakeUseSpeed   = 1500;
 volatile int16_t fakeUseSpeedLR = 0;      // 左右平移目标转速（0号通道，同强度） 
 volatile int16_t fakeUseOmega = 0;
 
+/* --- BMI088 陀螺仪（SPI1：PB3=SCK / PB4=MISO / PA7=MOSI；CS：PA4=加速度计 / PB0=陀螺仪）--- */
+volatile uint8_t BMI088_gyro_id;      /* 陀螺仪 ID（正常 0x0F，用来验证 SPI 通不通） */
+volatile float   BMI088_gyro[3];      /* 三轴角速度 rad/s：X / Y / Z */
+volatile float   gyro_offset[3];      /* 上电零漂标定值（rad/s） */
+volatile float   INS_yaw;             /* ★ 绝对角度（rad，上电时刻 = 0，逆时针为正） */
+
 /* --- 遥控器（DBUS）：WATCH 里直接看 rc_ctrl.rc.ch[0]~[3] --- */
 uint8_t  rc_buf[RC_FRAME_LENGTH];     /* DMA 接收缓冲区：原始 18 字节（生数据） */
 RC_ctrl_t rc_ctrl;                    /* 解码后的遥控器数据（熟数据，WATCH 看这个） */
@@ -126,6 +142,8 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_CAN1_Init(void);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -154,6 +172,23 @@ static void CAN1_Init(void)
 
   /* HAL宏：使能 CAN1 外设的时钟。STM32 外设默认断电，不开时钟则 CAN1 完全不工作 */
   __HAL_RCC_CAN1_CLK_ENABLE();                 // 开 CAN1 时钟
+
+  /* ★ 硬复位 CAN 外设，让下面的 HAL_CAN_Init 从干净状态重新配置
+
+     为什么需要：CubeMX 生成代码时给 main() 加了一个 MX_CAN1_Init()，它已经用
+     Prescaler=16 / TSeg1=1TQ / TSeg2=1TQ（=875kbps）初始化过一次 CAN，并且
+     把 CAN 拉到总线上处于 Normal 模式。这里如果不复位，会出现两个问题：
+       ① BTR 可能沿用 875kbps → 电调完全收不到指令
+       ② 前面若已在总线上出错进入 bus-off，HAL_CAN_Init 等 INAK 会超时（10ms）
+          → hcan1.State 变成 ERROR → 之后 ConfigFilter / Start 会静默失败
+
+     复位 + 把 State 手动置回 RESET 后，HAL_CAN_Init 会：
+       - 重新调用 HAL_CAN_MspInit（再开一次时钟，无害）
+       - 用下面 hcan1.Init 里的 1Mbps 参数重新写 BTR 寄存器         */
+  __HAL_RCC_CAN1_FORCE_RESET();
+  __HAL_RCC_CAN1_RELEASE_RESET();
+  hcan1.State = HAL_CAN_STATE_RESET;
+
   /* HAL宏：使能 GPIOD 的时钟。PD0/PD1 属于 D 口，不开时钟就配置不了这两个引脚 */
   __HAL_RCC_GPIOD_CLK_ENABLE();                // 开 GPIOD 时钟（PD0/PD1 在 D 口）
 
@@ -538,6 +573,76 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
 }
 
+/* ==========================================================================
+ * BMI088 陀螺仪驱动（最小版：只读角速度，不做姿态融合）
+ * 接线：SPI1 = PB3(SCK) / PB4(MISO) / PA7(MOSI)
+ *       CS   = PA4(加速度计 CS1_ACCEL) / PB0(陀螺仪 CS1_GYRO)，都是低电平选中
+ * 寄存器：0x00 = ID（陀螺仪应读 0x0F）
+ *         0x02~0x07 = X/Y/Z 三轴角速度，每轴 16 位（低字节在前）
+ * ========================================================================== */
+
+#define ACC_CS_L()   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET)
+#define ACC_CS_H()   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET)
+#define GYRO_CS_L()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET)
+#define GYRO_CS_H()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET)
+
+/*
+ * SPI 全双工收发 1 字节：发出去的同时就在收（SPI 的物理特性决定的）
+ * BMI088 用 SPI 模式 3（CPOL=1, CPHA=1），和 MX_SPI1_Init 里的配置一致
+ */
+static uint8_t BMI088_rw(uint8_t tx)
+{
+  uint8_t rx = 0;
+  /* HAL函数：SPI 全双工收发
+     参数：SPI句柄、发送缓冲、接收缓冲、字节数、超时(ms) */
+  HAL_SPI_TransmitReceive(&hspi1, &tx, &rx, 1, 100);
+  return rx;
+}
+
+/*
+ * 读陀螺仪的连续 len 个寄存器
+ * BMI088 的 SPI 协议规定：读操作的地址最高位要置 1，写操作清 0
+ * 整个过程 CS 必须一直保持低电平，读完才拉高（拉高 = 一帧结束）
+ */
+static void BMI088_gyro_read_regs(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+  uint8_t i;
+  reg |= 0x80;                  /* 最高位 = 1 → 读操作 */
+  GYRO_CS_L();
+  BMI088_rw(reg);               /* 先发寄存器地址 */
+  for (i = 0; i < len; i++)
+  {
+    buf[i] = BMI088_rw(0x00);   /* 之后每发一个空字节，就收回一个数据字节 */
+  }
+  GYRO_CS_H();
+}
+
+/*
+ * 读三轴角速度 → rad/s
+ * 寄存器 0x02~0x07 依次是 X_L, X_M, Y_L, Y_M, Z_L, Z_M（低字节在前）
+ * 注意：教材 P182 的文字写成"RATE_Z_MSB 到 RATE_X_LSB"是写反的，
+ *       以 P183 的代码为准（X 在前），这里和 P183 保持一致
+ */
+static void BMI088_read_gyro(float g[3])
+{
+  uint8_t buf[6];
+  BMI088_gyro_read_regs(0x02, buf, 6);
+  g[0] = (float)(int16_t)((buf[1] << 8) | buf[0]) * BMI088_GYRO_SEN;   /* X 轴 */
+  g[1] = (float)(int16_t)((buf[3] << 8) | buf[2]) * BMI088_GYRO_SEN;   /* Y 轴 */
+  g[2] = (float)(int16_t)((buf[5] << 8) | buf[4]) * BMI088_GYRO_SEN;   /* Z 轴 */
+}
+
+/*
+ * 读陀螺仪 ID（寄存器 0x00），正常返回 0x0F
+ * 作用：上电自检 —— 读不到 0x0F 说明 SPI 接线/片选/模式有问题，不用瞎猜
+ */
+static uint8_t BMI088_read_gyro_id(void)
+{
+  uint8_t id = 0;
+  BMI088_gyro_read_regs(0x00, &id, 1);
+  return id;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -546,7 +651,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   */
 int main(void)
 {
-\\
+
   /* USER CODE BEGIN 1 */
   /* USER CODE END 1 */
 
@@ -571,8 +676,51 @@ int main(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
+  MX_CAN1_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+
+  /* ★ CAN1 必须最先初始化！
+     原因：CubeMX 生成的 MX_CAN1_Init() 已经用 875kbps 把 CAN 拉到总线上了，
+     如果在这里先做 BMI088 的 1.3 秒零漂标定，CAN 就会在错误波特率下污染 1Mbps
+     总线 1.3 秒 → 4 个 C620 电调全部出错掉线（现象：RxCount=0、电机不动）。
+     所以 CAN1_Init() 必须紧跟在外设初始化之后、任何耗时操作之前调用。 */
   CAN1_Init();                      /* CAN1 初始化：整个程序只做一次 */
+
+  /* ---- BMI088 片选上电先拉高 ----
+     CubeMX 把 PA4/PB0 的初始电平配成了低电平，而 CS 是低电平选中，
+     不修的话上电瞬间加速度计和陀螺仪会同时被选中，两个芯片一起抢 MISO 总线 */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);   /* 加速度计 CS 拉高 */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);   /* 陀螺仪   CS 拉高 */
+
+  /* ---- BMI088 上电自检：读陀螺仪 ID，正常应该是 0x0F ---- */
+  BMI088_gyro_id = BMI088_read_gyro_id();
+  usart_printf("[BMI088] gyro_id = 0x%02X (expect 0x0F)\r\n", BMI088_gyro_id);
+
+  /* ---- 零漂标定：连续采 1000 次求平均（约 1.3 秒）
+     陀螺仪静止时也会输出几十 LSB 的零偏，不减掉的话积分出的角度会一直漂
+     ★ 这段时间小车必须静止不动！ */
+  {
+    float sum[3] = {0.0f, 0.0f, 0.0f};
+    float g[3];
+    int i;
+    for (i = 0; i < 1000; i++)
+    {
+      BMI088_read_gyro(g);
+      sum[0] += g[0];
+      sum[1] += g[1];
+      sum[2] += g[2];
+      HAL_Delay(1);
+    }
+    gyro_offset[0] = sum[0] / 1000.0f;
+    gyro_offset[1] = sum[1] / 1000.0f;
+    gyro_offset[2] = sum[2] / 1000.0f;
+  }
+  /* 用整数打印（放大 10 万倍），因为 usart_printf 没开浮点打印支持 */
+  usart_printf("[BMI088] offset(1e5) = %d %d %d rad/s\r\n",
+               (int)(gyro_offset[0] * 100000.0f),
+               (int)(gyro_offset[1] * 100000.0f),
+               (int)(gyro_offset[2] * 100000.0f));
 
   /* HAL函数：启动 USART3 的"DMA + 空闲中断"接收
      作用：DMA 在后台把遥控器发来的 18 字节搬进 rc_buf，
@@ -591,10 +739,37 @@ int main(void)
     /* HAL函数：阻塞式延时 1 毫秒（靠 SysTick 中断计时）
        这里的作用：构成固定 1kHz 的控制周期（PID 必须等间隔执行） */
     HAL_Delay(1); 
-    HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, GPIO_PIN_SET); 
-    fakeUseSpeed   = rc_ctrl.rc.ch[1] * 3;  // 右摇杆 上下 → 前后
-    fakeUseSpeedLR = rc_ctrl.rc.ch[0] * 3;
-    fakeUseOmega = rc_ctrl.rc.ch[2] * 3;
+    HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, GPIO_PIN_SET);
+
+    /* ---- BMI088 陀螺仪：读角速度 + 积分成绝对角度 ---- */
+    {
+      float g[3];
+      BMI088_read_gyro(g);
+      BMI088_gyro[0] = g[0];      /* 存进全局变量，WATCH 里可以直接看 */
+      BMI088_gyro[1] = g[1];
+      BMI088_gyro[2] = g[2];
+      /* 绝对角度 = Z 轴角速度积分（先减掉零漂），dt = 1ms
+         注意：256 分频下每次读约 200us，主循环实际约 1.2ms；
+               若转 90° 后 INS_yaw 明显小于 1.57，就把 0.001f 改成 0.0012f */
+      INS_yaw += (g[2] - gyro_offset[2]) * 0.001f;
+      /* 归一化到 ±π：每 1ms 的增量极小，两个 if 足够，不需要 while */
+      if (INS_yaw >  3.14159265f) INS_yaw -= 6.28318531f;
+      if (INS_yaw < -3.14159265f) INS_yaw += 6.28318531f;
+    } 
+    /* ---- 摇杆 → 地面系 → 旋转回车体系（yaw 补偿）----
+       摇杆推的方向 = 车相对"地面"要走的方向（上电时刻为参考方向）
+       用 INS_yaw 把地面系指令旋转回车体系，再交给轮子
+       yaw 逆时针为正：vx' = vx·cosθ + vy·sinθ
+                       vy' = -vx·sinθ + vy·cosθ */
+    {
+      float vx = rc_ctrl.rc.ch[1] * 3;      /* 摇杆前后（地面系） */
+      float vy = rc_ctrl.rc.ch[0] * 3;      /* 摇杆左右（地面系） */
+      float c  = cosf(INS_yaw);
+      float s  = sinf(INS_yaw);
+      fakeUseSpeed   = (int16_t)( vx * c + vy * s);
+      fakeUseSpeedLR = (int16_t)(-vx * s + vy * c);
+    }
+    fakeUseOmega = rc_ctrl.rc.ch[2] * 3;    /* 自转照旧：本来就该是车体系，不参与旋转 */
     SpeedLoop_Fake();      // 1kHz 控制周期
 
     /* 每 100ms 往电脑串口助手打印一次遥控器数据（用 DMA 发送，不占 CPU） */
@@ -671,6 +846,81 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN1_Init(void)
+{
+
+  /* USER CODE BEGIN CAN1_Init 0 */
+
+  /* USER CODE END CAN1_Init 0 */
+
+  /* USER CODE BEGIN CAN1_Init 1 */
+
+  /* USER CODE END CAN1_Init 1 */
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 16;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_1TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_1TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN1_Init 2 */
+
+  /* USER CODE END CAN1_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -720,8 +970,7 @@ static void MX_USART3_UART_Init(void)
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 100000;
-  huart3.Init.WordLength = UART_WORDLENGTH_9B;   /* DBUS = 8 数据位 + 偶校验 = 11 位帧
-                                                    （M=1 才是"8 数据位+校验"，M=0 只有 7 数据位） */
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_EVEN;
   huart3.Init.Mode = UART_MODE_TX_RX;
@@ -770,13 +1019,19 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOH, LED_R_Pin|LED_G_Pin|LED_B_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : LED_R_Pin LED_G_Pin LED_B_Pin */
   GPIO_InitStruct.Pin = LED_R_Pin|LED_G_Pin|LED_B_Pin;
@@ -784,6 +1039,20 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
